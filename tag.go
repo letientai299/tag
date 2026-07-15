@@ -3,14 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"syscall"
+	"slices"
 	"text/template"
 
 	"github.com/fatih/color"
@@ -23,17 +23,14 @@ func check(e error) {
 }
 
 func extractCmdExitCode(err error) int {
-	if err != nil {
-		// Extract real exit code
-		// Source: https://stackoverflow.com/a/10385867
-		if exiterr, ok := err.(*exec.ExitError); ok {
-			if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-				return status.ExitStatus()
-			}
-		}
-		return 1
+	if err == nil {
+		return 0
 	}
-	return 0
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return 1
 }
 
 func optionIndex(args []string, option string) int {
@@ -67,9 +64,8 @@ var (
 
 type AliasFile struct {
 	filename string
-	fmtStr   string
+	tmpl     *template.Template
 	buf      bytes.Buffer
-	writer   *bufio.Writer
 }
 
 func NewAliasFile() *AliasFile {
@@ -79,17 +75,14 @@ func NewAliasFile() *AliasFile {
 		"TAG_CMD_FMT_STRING",
 		`vim -c "call cursor({{.LineNumber}}, {{.ColumnNumber}})" "{{.Filename}}"`)
 
-	a := &AliasFile{
-		fmtStr:   "alias " + aliasPrefix + "{{.MatchIndex}}='" + aliasCmdFmtString + "'\n",
+	fmtStr := "alias " + aliasPrefix + "{{.MatchIndex}}='" + aliasCmdFmtString + "'\n"
+	return &AliasFile{
 		filename: aliasFilename,
+		tmpl:     template.Must(template.New("alias").Parse(fmtStr)),
 	}
-	a.writer = bufio.NewWriter(&a.buf)
-	return a
 }
 
 func (a *AliasFile) WriteAlias(index int, filename, linenum string, colnum string) {
-	t := template.Must(template.New("alias").Parse(a.fmtStr))
-
 	aliasVars := struct {
 		MatchIndex   int
 		Filename     string
@@ -97,15 +90,12 @@ func (a *AliasFile) WriteAlias(index int, filename, linenum string, colnum strin
 		ColumnNumber string
 	}{index, filename, linenum, colnum}
 
-	err := t.Execute(a.writer, aliasVars)
+	err := a.tmpl.Execute(&a.buf, aliasVars)
 	check(err)
 }
 
 func (a *AliasFile) WriteFile() {
-	err := a.writer.Flush()
-	check(err)
-
-	err = ioutil.WriteFile(a.filename, a.buf.Bytes(), 0644)
+	err := os.WriteFile(a.filename, a.buf.Bytes(), 0644)
 	check(err)
 }
 
@@ -175,48 +165,24 @@ func passThrough(cmd *exec.Cmd) int {
 	return extractCmdExitCode(err)
 }
 
-func validateSearchProg(prog string) error {
-	switch prog {
-	case "ag", "rg":
+func constructTagArgs(userArgs []string) []string {
+	if !isatty(os.Stdout) {
 		return nil
-	default:
-		return fmt.Errorf(
-			"invalid environment variable TAG_SEARCH_PROG='%s'. only 'ag' and 'rg' are supported.",
-			prog)
 	}
+	// ripgrep can't handle more than one --color option, so if the user provides one
+	// we have to explicilty keep tag from passing its own --color option
+	if optionIndex(userArgs, "--color") >= 0 {
+		return []string{"--heading", "--column"}
+	}
+	return []string{"--heading", "--color", "always", "--column"}
 }
 
-func constructTagArgs(searchProg string, userArgs []string) []string {
-	if isatty(os.Stdout) {
-		switch searchProg {
-		case "ag":
-			return []string{"--group", "--color", "--column"}
-		case "rg":
-			// ripgrep can't handle more than one --color option, so if the user provides one
-			// we have to explicilty keep tag from passing its own --color option
-			if optionIndex(userArgs, "--color") >= 0 {
-				return []string{"--heading", "--column"}
-			}
-			return []string{"--heading", "--color", "always", "--column"}
-		}
-	}
-	return []string{}
-}
-
-func handleColorSetting(prog string, args []string) {
-	switch prog {
-	case "ag":
-		color.NoColor = (optionIndex(args, "--nocolor") >= 0)
-	case "rg":
-		colorFlagIdx := optionIndex(args, "--color")
-		color.NoColor = (colorFlagIdx >= 0 && args[colorFlagIdx+1] == "never")
-	}
+func handleColorSetting(args []string) {
+	colorFlagIdx := optionIndex(args, "--color")
+	color.NoColor = colorFlagIdx >= 0 && colorFlagIdx+1 < len(args) && args[colorFlagIdx+1] == "never"
 }
 
 func main() {
-	searchProg := getEnvDefault("TAG_SEARCH_PROG", "ag")
-	check(validateSearchProg(searchProg))
-
 	userArgs := os.Args[1:]
 
 	disableTag := false
@@ -224,22 +190,22 @@ func main() {
 
 	switch i := optionIndex(userArgs, "--notag"); {
 	case i > 0:
-		userArgs = append(userArgs[:i], userArgs[i+1:]...)
+		userArgs = slices.Delete(userArgs, i, i+1)
 		fallthrough
 	case len(userArgs) == 0: // no arguments; fall back to help message
 		disableTag = true
 	default:
-		tagArgs = constructTagArgs(searchProg, userArgs)
+		tagArgs = constructTagArgs(userArgs)
 	}
 	finalArgs := append(tagArgs, userArgs...)
 
-	cmd := exec.Command(searchProg, finalArgs...)
+	cmd := exec.Command("rg", finalArgs...)
 
 	if disableTag || !isatty(os.Stdin) || !isatty(os.Stdout) {
 		// Data being piped from stdin
 		os.Exit(passThrough(cmd))
 	}
 
-	handleColorSetting(searchProg, finalArgs)
+	handleColorSetting(finalArgs)
 	os.Exit(generateTags(cmd))
 }
