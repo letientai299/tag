@@ -169,12 +169,16 @@ func constructTagArgs(userArgs []string) []string {
 	if !isatty(os.Stdout) {
 		return nil
 	}
+	// --with-filename forces the filename heading even when searching a single
+	// file, which rg omits by default. Without it, tag treats the first match
+	// line as the file path and generates broken aliases.
+	base := []string{"--with-filename", "--heading", "--column"}
 	// ripgrep can't handle more than one --color option, so if the user provides one
 	// we have to explicilty keep tag from passing its own --color option
 	if optionIndex(userArgs, "--color") >= 0 {
-		return []string{"--heading", "--column"}
+		return base
 	}
-	return []string{"--heading", "--color", "always", "--column"}
+	return append(base, "--color", "always")
 }
 
 func handleColorSetting(args []string) {
